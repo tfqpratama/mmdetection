@@ -4,19 +4,28 @@ import os.path as osp
 import pickle
 import shutil
 import tempfile
+import numpy
 
 import mmcv
 import torch
 import torch.distributed as dist
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
-from mmcv.runner import get_dist_info, init_dist, load_checkpoint
+from mmcv.runner import get_dist_info, load_checkpoint
 
+from mmdet.apis import init_dist
 from mmdet.core import coco_eval, results2json, wrap_fp16_model
 from mmdet.datasets import build_dataloader, build_dataset
 from mmdet.models import build_detector
 
+import cv2
+import xml.etree.ElementTree as ET
+from xml.etree.ElementTree import Element, SubElement, tostring, ElementTree
+import xml.dom.minidom as md
 
-def single_gpu_test(model, data_loader, show=False):
+from pprint import pprint
+
+
+def single_gpu_test(model, data_loader, show=False, save_dir=None, score_thr=0.5):
     model.eval()
     results = []
     dataset = data_loader.dataset
@@ -27,12 +36,88 @@ def single_gpu_test(model, data_loader, show=False):
         results.append(result)
 
         if show:
-            model.module.show_result(data, result)
+            model.module.show_result(data, result, score_thr=score_thr)
+
+        if save_dir is not None:
+            generate_annotation(data, result, save_dir, score_thr=score_thr)
 
         batch_size = data['img'][0].size(0)
         for _ in range(batch_size):
             prog_bar.update()
     return results
+
+
+# def _generate_annotation(boxes, scores, labels, difficults, image_name, output_dir, conf_thresh, labels_to_names):
+def generate_annotation(data, boxes, output_dir, score_thr=0.3):
+    labels_to_names = {0: 'flower', 1: 'seed'}
+    image_name = data['img_meta'][0].data[0][0]['filename']
+    scale = data['img_meta'][0].data[0][0]['scale_factor']
+    output_name = os.path.splitext(os.path.basename(image_name))[0] + '.xml'
+    output_name = os.path.join(output_dir, output_name)
+        
+    top = Element('annotation')
+
+    folder = SubElement(top, 'folder')
+    folder.text = os.path.basename(os.path.dirname(output_name))
+
+    filename = SubElement(top, 'filename')
+    filename.text = os.path.basename(image_name)
+
+    path = SubElement(top, 'path')
+    path.text = os.path.join('../images', os.path.basename(image_name))
+
+    source = SubElement(top, 'source')
+    database = SubElement(source, 'database')
+    database.text = 'Unknown'
+
+    img = cv2.imread(image_name, 1)
+    height, width, depth = img.shape
+        
+    size = SubElement(top, 'size')
+    elem = SubElement(size, 'width')
+    elem.text = str(width)
+    elem = SubElement(size, 'height')
+    elem.text = str(height)
+    elem = SubElement(size, 'depth')
+    elem.text = str(depth)
+
+    segmented = SubElement(top, 'segmented')
+    segmented.text = '0'
+
+    for i, label in enumerate(boxes):
+        for box in label:
+            if box[-1] < score_thr:
+                continue
+    
+            box[:-1] = box[:-1].astype(numpy.int)
+            box[[0, 2]] = numpy.clip(box[[0, 2]], 1, width)
+            box[[1, 3]] = numpy.clip(box[[1, 3]], 1, height)
+
+            obj = SubElement(top, 'object')
+
+            name = SubElement(obj, 'name')
+            name.text = labels_to_names[i]
+            pose = SubElement(obj, 'pose')
+            pose.text = 'Unspecified'
+            truncated = SubElement(obj, 'truncated')
+            truncated.text = '0'
+            difficult = SubElement(obj, 'difficult')
+            difficult.text = str(0)
+
+            bndbox = SubElement(obj, 'bndbox')
+            for key, value in zip(['xmin', 'ymin', 'xmax', 'ymax'], box):
+                elem = SubElement(bndbox, key)
+                elem.text = str(value)
+    _convert_to_file(top, output_name)
+
+
+def _convert_to_file(top, output_name):
+    s = tostring(top, 'utf-8')
+    document = md.parseString(s)
+
+    with open(output_name, 'w') as f:
+        document.writexml(f, encoding='utf-8', newl='\n', indent='', addindent='\t')
+        f.close()
 
 
 def multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
@@ -132,7 +217,7 @@ def collect_results_gpu(result_part, size):
     # padding result part tensor to max length
     shape_max = torch.tensor(shape_list).max()
     part_send = torch.zeros(shape_max, dtype=torch.uint8, device='cuda')
-    part_send[:shape_tensor[0]] = part_tensor
+    part_send[:shape_tensor[0]] =  part_tensor
     part_recv_list = [
         part_tensor.new_zeros(shape_max) for _ in range(world_size)
     ]
@@ -193,7 +278,7 @@ def main():
         ('Please specify at least one operation (save or show the results) '
          'with the argument "--out" or "--show" or "--json_out"')
 
-    if args.out is not None and not args.out.endswith(('.pkl', '.pickle')):
+    if args.out is not None and not args.out.endswith(('.pkl', '.pickle', '')):
         raise ValueError('The output file must be a pkl file.')
 
     if args.json_out is not None and args.json_out.endswith('.json'):
@@ -237,8 +322,15 @@ def main():
         model.CLASSES = dataset.CLASSES
 
     if not distributed:
-        model = MMDataParallel(model, device_ids=[0])
-        outputs = single_gpu_test(model, data_loader, args.show)
+        if args.out is None or args.out.endswith(('.pkl', '.pickle')):
+            model = MMDataParallel(model, device_ids=[0])
+            outputs = single_gpu_test(model, data_loader, args.show)
+        else:
+            if not os.path.exists(args.out):
+                os.makedirs(args.out)
+            model = MMDataParallel(model, device_ids=[0])
+            outputs = single_gpu_test(model, data_loader, args.show, save_dir=args.out)
+            exit()
     else:
         model = MMDistributedDataParallel(model.cuda())
         outputs = multi_gpu_test(model, data_loader, args.tmpdir,
