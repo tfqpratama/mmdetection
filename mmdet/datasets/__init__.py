@@ -6,11 +6,13 @@ from .dataset_wrappers import ConcatDataset, RepeatDataset
 from .loader import DistributedGroupSampler, GroupSampler, build_dataloader
 from .registry import DATASETS
 from .voc import VOCDataset
+from .soybean import SoybeanDataset
 from .wider_face import WIDERFaceDataset
 from .xml_style import XMLDataset
+from .xml_style_custom import XMLCustomDataset
 
 __all__ = [
-    'CustomDataset', 'XMLDataset', 'CocoDataset', 'VOCDataset',
+    'CustomDataset', 'XMLDataset', 'XMLCustomDataset', 'CocoDataset', 'VOCDataset', 'SoybeanDataset'
     'CityscapesDataset', 'GroupSampler', 'DistributedGroupSampler',
     'build_dataloader', 'ConcatDataset', 'RepeatDataset', 'WIDERFaceDataset',
     'DATASETS', 'build_dataset'
